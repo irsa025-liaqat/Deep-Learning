@@ -1,0 +1,396 @@
+#####Tutorial 11:
+###Semantic Segmentation using Pre-Trained Model
+
+import os, glob, zipfile, random, time
+import xml.etree.ElementTree as ET
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from PIL import Image
+
+import torch
+import torchvision
+from torchvision import models, transforms
+import torchvision.transforms.functional as TF
+from torchvision.ops import box_iou
+from torch.utils.data import Dataset, DataLoader
+
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("torch", torch.__version__, "| torchvision", torchvision.__version__, "| device:", device)
+DATA_DIR = "/content/dataset"
+
+if not os.path.exists(f"{DATA_DIR}/train"):
+    from google.colab import files
+    uploaded = files.upload()                  # pick 150_data_set_v1i_voc.zip
+    zip_name = list(uploaded.keys())[0]
+    # --- or from Google Drive: ---
+    # from google.colab import drive
+    # drive.mount('/content/drive')
+    # zip_name = '/content/drive/MyDrive/150_data_set_v1i_voc.zip'
+    with zipfile.ZipFile(zip_name) as z:
+        z.extractall(DATA_DIR)
+
+for split in ["train", "valid", "test"]:
+    print(split, "->", len(glob.glob(f"{DATA_DIR}/{split}/*.jpg")), "images")
+CLASSES = ["background", "Book", "Bottle", "Plate"]
+CLASS_TO_ID = {n: i for i, n in enumerate(CLASSES)}
+
+
+def read_voc(xml_path):
+    # returns a list of boxes [x1, y1, x2, y2] and a list of class names for one image
+    root = ET.parse(xml_path).getroot()
+    boxes, names = [], []
+    for obj in root.findall("object"):
+        name = obj.find("name").text.strip()
+        b = obj.find("bndbox")
+        x1, y1, x2, y2 = [float(b.find(k).text) for k in ("xmin", "ymin", "xmax", "ymax")]
+        if x2 <= x1 or y2 <= y1:          # skip broken boxes
+            continue
+        if name in CLASS_TO_ID:
+            boxes.append([x1, y1, x2, y2]); names.append(name)
+    return boxes, names
+
+
+def make_semantic_mask(h, w, boxes, names):
+    m = np.zeros((h, w), dtype=np.uint8)
+    for (x1, y1, x2, y2), n in zip(boxes, names):
+        m[int(y1):int(y2), int(x1):int(x2)] = CLASS_TO_ID[n]
+    return m
+
+
+def load_item(img_path):
+    # one image (PIL), its boxes/names, and its semantic mask, all at the ORIGINAL resolution
+    img = Image.open(img_path).convert("RGB")
+    boxes, names = read_voc(os.path.splitext(img_path)[0] + ".xml")
+    w, h = img.size
+    return img, boxes, names, make_semantic_mask(h, w, boxes, names)
+
+
+train_paths = sorted(glob.glob(f"{DATA_DIR}/train/*.jpg"))
+val_paths   = sorted(glob.glob(f"{DATA_DIR}/valid/*.jpg"))
+test_paths  = sorted(glob.glob(f"{DATA_DIR}/test/*.jpg"))
+eval_paths  = val_paths + test_paths       # images the models have NOT been trained on
+print("images used for testing:", len(eval_paths))
+#####Task 1: Test a pre-trained model on my data (DeepLabV3)##############################
+from torchvision.models.segmentation import DeepLabV3_ResNet101_Weights
+
+dl_weights = DeepLabV3_ResNet101_Weights.DEFAULT
+dl_model = models.segmentation.deeplabv3_resnet101(weights=dl_weights).to(device)
+dl_model.eval()                                   # evaluation mode
+
+VOC_CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair",
+               "cow", "diningtable", "dog", "horse", "motorbike", "person", "pottedplant", "sheep", "sofa",
+               "train", "tvmonitor"]
+VOC_BOTTLE = VOC_CLASSES.index("bottle")          
+# same preprocessing as the tutorial: to tensor + ImageNet normalization
+preprocess = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+
+def deeplab_predict(pil_image):
+    input_tensor = preprocess(pil_image).unsqueeze(0).to(device)      # add batch dimension
+    with torch.no_grad():
+        output = dl_model(input_tensor)["out"][0]                     # (21, H, W)
+    return output.argmax(0).cpu().numpy()                             # class with the highest score per pixel
+
+
+# Pascal VOC colour palette (21 classes), from the tutorial
+VOC_COLORS = np.array([
+    [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0], [0, 0, 128], [128, 0, 128], [0, 128, 128],
+    [128, 128, 128], [64, 0, 0], [192, 0, 0], [64, 128, 0], [192, 128, 0], [64, 0, 128], [192, 0, 128],
+    [64, 128, 128], [192, 128, 128], [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0], [0, 64, 128]
+], dtype=np.uint8)
+
+def decode_segmentation(mask):
+    return VOC_COLORS[mask]            # looks up a colour for every pixel at once
+
+# colours for MY 4 classes (used to draw the ground-truth masks)
+MY_COLORS = np.array([[0, 0, 0], [230, 60, 60], [60, 120, 230], [60, 200, 90]], dtype=np.uint8)
+
+
+img, boxes, names, gt_mask = load_item(eval_paths[0])
+pred = deeplab_predict(img)
+
+plt.figure(figsize=(15, 5))
+plt.subplot(1, 3, 1); plt.title("Original Image");                plt.imshow(img);                        plt.axis("off")
+plt.subplot(1, 3, 2); plt.title("My labels (boxes as mask)");     plt.imshow(MY_COLORS[gt_mask]);         plt.axis("off")
+plt.subplot(1, 3, 3); plt.title("DeepLabV3 Segmentation");        plt.imshow(decode_segmentation(pred));  plt.axis("off")
+plt.show()
+print("VOC classes DeepLab found in this image:", [VOC_CLASSES[c] for c in np.unique(pred)])
+###### Visualize more examples
+n = 6
+fig, axes = plt.subplots(n, 3, figsize=(10, 3.2 * n))
+for row, p in enumerate(eval_paths[:n]):
+    img, boxes, names, gt_mask = load_item(p)
+    pred = deeplab_predict(img)
+    axes[row, 0].imshow(img);                        axes[row, 1].imshow(MY_COLORS[gt_mask]);   axes[row, 2].imshow(decode_segmentation(pred))
+    if row == 0:
+        axes[row, 0].set_title("Image"); axes[row, 1].set_title("My labels"); axes[row, 2].set_title("DeepLabV3")
+for a in axes.ravel(): a.axis("off")
+plt.tight_layout(); plt.show()
+print("My colours -> red: Book, blue: Bottle, green: Plate")
+###### Test on the whole test set################################
+inter, union = 0, 0
+# counts[my_class, voc_class] = number of pixels
+counts = np.zeros((len(CLASSES), len(VOC_CLASSES)), dtype=np.int64)
+
+for p in eval_paths:
+    img, boxes, names, gt_mask = load_item(p)
+    pred = deeplab_predict(img)
+
+    gt_b, pr_b = (gt_mask == CLASS_TO_ID["Bottle"]), (pred == VOC_BOTTLE)
+    inter += (gt_b & pr_b).sum()
+    union += (gt_b | pr_b).sum()
+
+    for c in range(len(CLASSES)):
+        counts[c] += np.bincount(pred[gt_mask == c], minlength=len(VOC_CLASSES))
+
+print(f"DeepLabV3 Bottle IoU on {len(eval_paths)} unseen images: {inter / max(union, 1):.4f}\n")
+
+for c in range(1, len(CLASSES)):
+    total = counts[c].sum()
+    top = np.argsort(-counts[c])[:3]
+    desc = ", ".join(f"{VOC_CLASSES[k]} {100 * counts[c, k] / total:.0f}%" for k in top)
+    print(f"Pixels inside my {CLASSES[c]:6s} boxes were mostly predicted as: {desc}")
+######################## Task 2: Implement Mask R-CNN ###################################
+from torchvision.models.detection import maskrcnn_resnet50_fpn, MaskRCNN_ResNet50_FPN_Weights
+
+mr_weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+mr_pre = maskrcnn_resnet50_fpn(weights=mr_weights).to(device)
+mr_pre.eval()
+COCO_NAMES = mr_weights.meta["categories"]
+print("COCO has", len(COCO_NAMES), "category names. book:", "book" in COCO_NAMES,
+      "| bottle:", "bottle" in COCO_NAMES, "| plate:", "plate" in COCO_NAMES)
+def run_maskrcnn(model, pil_image, score_thr=0.5):
+    # Mask R-CNN takes images as tensors in [0, 1] (it normalizes internally)
+    x = TF.to_tensor(pil_image).to(device)
+    with torch.no_grad():
+        out = model([x])[0]
+    keep = out["scores"] >= score_thr
+    return {k: v[keep].cpu() for k, v in out.items()}      # boxes, labels, scores, masks
+
+
+INSTANCE_COLORS = [(1, 0.2, 0.2), (0.2, 0.5, 1), (0.2, 0.8, 0.3), (1, 0.8, 0.1), (0.8, 0.3, 0.9), (0.1, 0.8, 0.8)]
+
+def show_instances(ax, pil_image, result, class_names, title=""):
+    # draws the masks, boxes and labels on top of the image
+    img = np.array(pil_image).astype(np.float32) / 255.0
+    overlay = img.copy()
+    for i in range(len(result["boxes"])):
+        color = np.array(INSTANCE_COLORS[i % len(INSTANCE_COLORS)])
+        m = result["masks"][i, 0].numpy() > 0.5
+        overlay[m] = 0.5 * overlay[m] + 0.5 * color
+    ax.imshow(overlay)
+    for i in range(len(result["boxes"])):
+        x1, y1, x2, y2 = result["boxes"][i].tolist()
+        color = INSTANCE_COLORS[i % len(INSTANCE_COLORS)]
+        ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor=color, linewidth=2))
+        label = f"{class_names[int(result['labels'][i])]} {result['scores'][i]:.2f}"
+        ax.text(x1, max(y1 - 3, 8), label, color="white", fontsize=8,
+                bbox=dict(facecolor=color, alpha=0.8, pad=1, edgecolor="none"))
+    ax.set_title(title); ax.axis("off")
+
+
+n = 6
+fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+for ax, p in zip(axes.ravel(), eval_paths[:n]):
+    img = Image.open(p).convert("RGB")
+    show_instances(ax, img, run_maskrcnn(mr_pre, img), COCO_NAMES, "Pre-trained Mask R-CNN (COCO)")
+plt.tight_layout(); plt.show()
+def match_stats(pred_boxes, pred_names, gt_boxes, gt_names, eval_names, iou_thr=0.5):
+    # returns {class: [TP, FP, FN]} for ONE image
+    stats = {n: [0, 0, 0] for n in eval_names}
+    for n in eval_names:
+        p = [b for b, nm in zip(pred_boxes, pred_names) if nm == n]     # already sorted by score
+        g = [b for b, nm in zip(gt_boxes, gt_names) if nm == n]
+        if len(g) == 0:
+            stats[n][1] += len(p); continue
+        if len(p) == 0:
+            stats[n][2] += len(g); continue
+        iou = box_iou(torch.tensor(p, dtype=torch.float32), torch.tensor(g, dtype=torch.float32)).numpy()
+        matched, tp = set(), 0
+        for i in range(len(p)):
+            for j in np.argsort(-iou[i]):
+                if iou[i, j] < iou_thr:
+                    break
+                if j not in matched:
+                    matched.add(j); tp += 1
+                    break
+        stats[n][0] += tp
+        stats[n][1] += len(p) - tp
+        stats[n][2] += len(g) - tp
+    return stats
+
+
+def evaluate_detector(model, paths, label_to_name, eval_names, score_thr=0.5):
+    # label_to_name: function that turns the model's label id into one of MY class names (or None to ignore)
+    total = {n: [0, 0, 0] for n in eval_names}
+    for p in paths:
+        img, gt_boxes, gt_names, _ = load_item(p)
+        res = run_maskrcnn(model, img, score_thr)
+        pr_boxes, pr_names = [], []
+        for b, l in zip(res["boxes"].tolist(), res["labels"].tolist()):
+            nm = label_to_name(l)
+            if nm is not None:
+                pr_boxes.append(b); pr_names.append(nm)
+        s = match_stats(pr_boxes, pr_names, gt_boxes, gt_names, eval_names)
+        for n in eval_names:
+            for k in range(3):
+                total[n][k] += s[n][k]
+    return total
+
+
+def print_table(total, title):
+    print(title)
+    print(f"{'class':8s} {'TP':>4s} {'FP':>4s} {'FN':>4s} {'precision':>10s} {'recall':>8s}")
+    for n, (tp, fp, fn) in total.items():
+        prec = tp / max(tp + fp, 1); rec = tp / max(tp + fn, 1)
+        print(f"{n:8s} {tp:4d} {fp:4d} {fn:4d} {prec:10.3f} {rec:8.3f}")
+    print()
+
+
+def coco_to_mine(label_id):
+    name = COCO_NAMES[label_id]
+    return {"book": "Book", "bottle": "Bottle"}.get(name)        # everything else is ignored
+
+
+pre_stats = evaluate_detector(mr_pre, eval_paths, coco_to_mine, ["Book", "Bottle"])
+print_table(pre_stats, "Pre-trained Mask R-CNN (COCO) on my unseen images:")
+########################## Fine-tune Mask R-CNN on my own 3 classes ####################################
+class VOCInstanceDataset(Dataset):
+    # gives (image, target) in the format Mask R-CNN wants
+    def __init__(self, paths, augment=False):
+        self.paths = paths
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.paths[idx]).convert("RGB")
+        w, h = img.size
+        boxes, names = read_voc(os.path.splitext(self.paths[idx])[0] + ".xml")
+
+        boxes_t = torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+        labels_t = torch.tensor([CLASS_TO_ID[n] for n in names], dtype=torch.int64)
+
+        # one binary mask per object (a filled rectangle)
+        masks_t = torch.zeros((len(boxes), h, w), dtype=torch.uint8)
+        for k, (x1, y1, x2, y2) in enumerate(boxes):
+            xi1, yi1 = int(round(x1)), int(round(y1))
+            xi2, yi2 = max(int(round(x2)), xi1 + 1), max(int(round(y2)), yi1 + 1)
+            masks_t[k, yi1:yi2, xi1:xi2] = 1
+
+        if self.augment and random.random() < 0.5:          # horizontal flip
+            img = TF.hflip(img)
+            masks_t = masks_t.flip(-1)
+            if len(boxes_t):
+                boxes_t = torch.stack([w - boxes_t[:, 2], boxes_t[:, 1], w - boxes_t[:, 0], boxes_t[:, 3]], dim=1)
+
+        target = {"boxes": boxes_t, "labels": labels_t, "masks": masks_t}
+        return TF.to_tensor(img), target
+
+
+def collate_fn(batch):
+    return tuple(zip(*batch))          # detection models want lists, not stacked tensors
+
+
+train_loader = DataLoader(VOCInstanceDataset(train_paths, augment=True), batch_size=4, shuffle=True, collate_fn=collate_fn)
+val_loader   = DataLoader(VOCInstanceDataset(val_paths),                 batch_size=4, shuffle=False, collate_fn=collate_fn)
+print("train batches:", len(train_loader), "| val batches:", len(val_loader))
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+
+NUM_CLASSES = len(CLASSES)      # background + 3
+
+
+def build_maskrcnn(num_classes):
+    # my images are small (~300 px) so I use smaller input sizes than the default (800) to train faster
+    model = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT, min_size=400, max_size=600)
+
+    # new box/class head
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    # new mask head
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, 256, num_classes)
+    return model
+
+
+mr_model = build_maskrcnn(NUM_CLASSES).to(device)
+print("trainable parameters:", sum(p.numel() for p in mr_model.parameters() if p.requires_grad))
+############################# Train ##############################################
+EPOCHS = 10
+params = [p for p in mr_model.parameters() if p.requires_grad]
+optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)     # lower the lr after 5 epochs
+
+
+def to_device(imgs, targets):
+    imgs = [i.to(device) for i in imgs]
+    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+    return imgs, targets
+
+
+history = {"train_loss": [], "val_loss": []}
+for epoch in range(EPOCHS):
+    t0 = time.time()
+    mr_model.train()
+    running = 0.0
+    for imgs, targets in train_loader:
+        imgs, targets = to_device(imgs, targets)
+        loss_dict = mr_model(imgs, targets)         # in train mode the model returns its losses
+        loss = sum(loss_dict.values())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        running += loss.item()
+    scheduler.step()
+
+    # validation loss (model stays in train mode so it returns losses, but no gradients are computed)
+    val_running = 0.0
+    with torch.no_grad():
+        for imgs, targets in val_loader:
+            imgs, targets = to_device(imgs, targets)
+            val_running += sum(mr_model(imgs, targets).values()).item()
+
+    history["train_loss"].append(running / len(train_loader))
+    history["val_loss"].append(val_running / len(val_loader))
+    print(f"Epoch {epoch+1:2d}/{EPOCHS} | train loss {history['train_loss'][-1]:.4f} | "
+          f"val loss {history['val_loss'][-1]:.4f} | {time.time() - t0:.0f}s")
+
+plt.plot(history["train_loss"], label="train"); plt.plot(history["val_loss"], label="val")
+plt.title("Mask R-CNN fine-tuning loss"); plt.xlabel("epoch"); plt.legend(); plt.show()
+##########################33 Evaluate the fine-tuned model ###########################
+mr_model.eval()
+ft_stats = evaluate_detector(mr_model, eval_paths, lambda l: CLASSES[l], ["Book", "Bottle", "Plate"])
+print_table(ft_stats, "Fine-tuned Mask R-CNN on my unseen images:")
+
+print("Quick comparison on the two classes COCO knows (Book and Bottle):")
+print(f"{'class':8s} {'pretrained P/R':>18s} {'fine-tuned P/R':>18s}")
+for n in ["Book", "Bottle"]:
+    a, b = pre_stats[n], ft_stats[n]
+    pa, ra = a[0] / max(a[0] + a[1], 1), a[0] / max(a[0] + a[2], 1)
+    pb, rb = b[0] / max(b[0] + b[1], 1), b[0] / max(b[0] + b[2], 1)
+    print(f"{n:8s} {pa:9.2f} / {ra:4.2f}   {pb:9.2f} / {rb:4.2f}")
+###########################Visualize: pre-trained vs fine-tuned on the same images#####################
+n = 5
+fig, axes = plt.subplots(n, 3, figsize=(14, 4.2 * n))
+for row, p in enumerate(test_paths[:n] if len(test_paths) >= n else eval_paths[:n]):
+    img, gt_boxes, gt_names, gt_mask = load_item(p)
+    axes[row, 0].imshow(MY_COLORS[gt_mask]); axes[row, 0].axis("off")
+    show_instances(axes[row, 1], img, run_maskrcnn(mr_pre, img),   COCO_NAMES, "")
+    show_instances(axes[row, 2], img, run_maskrcnn(mr_model, img), CLASSES,    "")
+    if row == 0:
+        axes[row, 0].set_title("My labels"); axes[row, 1].set_title("Pre-trained (COCO)"); axes[row, 2].set_title("Fine-tuned (my 3 classes)")
+plt.tight_layout(); plt.show()
+# save the fine-tuned weights so I don't have to retrain
+torch.save(mr_model.state_dict(), "maskrcnn_books_bottles_plates.pth")
+print("saved")
